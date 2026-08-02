@@ -19,7 +19,6 @@ use futures::{prelude::*, ready, stream::Fuse, task::*};
 use in_flight_requests::InFlightRequests;
 use pin_project::pin_project;
 use std::{
-    any::Any,
     convert::TryFrom,
     fmt,
     pin::Pin,
@@ -279,7 +278,10 @@ where
 #[must_use]
 #[pin_project()]
 #[derive(Debug)]
-pub struct RequestDispatch<Req, Resp, C> {
+pub struct RequestDispatch<Req, Resp, C>
+where
+    C: Sink<ClientMessage<Req>>,
+{
     /// Writes requests to the wire and reads responses off the wire.
     #[pin]
     transport: Fuse<C>,
@@ -293,9 +295,8 @@ pub struct RequestDispatch<Req, Resp, C> {
     config: Config,
     /// Produces errors that can be sent in response to any unprocessed requests at the time
     /// RequestDispatch is dropped. Correctness note: this field should only be populated by
-    /// RequestDispatch::poll, which relies on downcasting the Any to a concrete error type
-    /// determined within the poll function.
-    terminal_error: Option<ChannelError<dyn Any + Send + Sync + 'static>>,
+    /// RequestDispatch::poll.
+    terminal_error: Option<ChannelError<C::Error>>,
 }
 
 impl<Req, Resp, C> RequestDispatch<Req, Resp, C>
@@ -355,7 +356,7 @@ where
 
     fn terminal_error_mut<'a>(
         self: &'a mut Pin<&mut Self>,
-    ) -> &'a mut Option<ChannelError<dyn Any + Send + Sync + 'static>> {
+    ) -> &'a mut Option<ChannelError<C::Error>> {
         self.as_mut().project().terminal_error
     }
 
@@ -662,17 +663,13 @@ where
         loop {
             if let Some(e) = self.terminal_error_mut() {
                 tracing::debug!("RpcError::Channel");
-                let e: ChannelError<C::Error> = e
-                    .clone()
-                    .downcast()
-                    .expect("Invariant: ChannelError must store a C::Error");
                 ready!(self.shut_down_with_terminal_error(cx, e.clone().upcast_error()));
-                return Poll::Ready(Err(e));
+                return Poll::Ready(Err(e.clone()));
             }
             let result = ready!(self.run(cx));
             match result {
                 Ok(()) => return Poll::Ready(Ok(())),
-                Err(e) => *self.terminal_error_mut() = Some(e.upcast_any()),
+                Err(e) => *self.terminal_error_mut() = Some(e),
             }
         }
     }
